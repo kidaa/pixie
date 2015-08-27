@@ -645,7 +645,9 @@ returns true"
    :signatures [[coll]]
    :added "0.1"}
   [coll]
-  (not (seq coll)))
+  (if (satisfies? ICounted coll)
+    (zero? (count coll))
+    (not (seq coll))))
 
 (defn not-empty?
   {:doc "returns true if the collection has items, otherwise false"
@@ -839,7 +841,7 @@ there's a value associated with the key. Use `some` for checking for values."
 
             (fn [] ~@finally)))))))
 
-(defn .
+#_(defn .
   {:doc "Access the field named by the symbol.
 
 If further arguments are passed, invokes the method named by symbol, passing the object and arguments."
@@ -1181,14 +1183,9 @@ Creates new maps if the keys are not present."
 (defmacro deftype
   {:doc "Define a custom type."
    :examples [["(deftype Person [name]
-  Object
-  (say-hi [self other-name]
-    (str \"Hi, I'm \" name \". You're \" other-name \", right?\"))
-
   IObject
   (-str [self]
     (str \"<Person \" (pr-str name) \">\")))"]
-              ["(.say-hi (->Person \"James\") \"Paul\")" nil "Hi, I'm James. You're Paul, right?"]
               ["(str (->Person \"James\"))" nil "<Person \"James\">"]]
    :added "0.1"}
   [nm fields & body]
@@ -1254,42 +1251,64 @@ Creates new maps if the keys are not present."
          ~ctor
          ~@proto-bodies)))
 
+(defn -make-record-assoc-body [cname fields]
+  (let [k-sym (gensym "k")
+        v-sym (gensym "v")
+        this-sym (gensym "this")
+        result `(-assoc [~this-sym ~k-sym ~v-sym]
+                 (case ~k-sym
+                   ~@(mapcat
+                      (fn [k]
+                        [k `(~cname ~@(mapv (fn [x]
+                                             (if (= x k)
+                                               v-sym
+                                               `(get-field ~this-sym ~x)))
+                                           fields))])
+                      fields)
+                   (throw [:pixie.stdlib/NotImplementedException
+                           (str "Can't assoc to a unknown field: " ~k-sym)])))]
+    result))
+
 (defmacro defrecord
   {:doc "Define a record type.
 
 Similar to `deftype`, but supports construction from a map using `map->Type`
 and implements IAssociative, ILookup and IObject."
    :added "0.1"}
-  [nm fields & body]
+  [nm field-syms & body]
   (let [ctor-name (symbol (str "->" (name nm)))
         map-ctor-name (symbol (str "map" (name ctor-name)))
-        fields (transduce (map (comp keyword name)) conj fields)
+        fields (transduce (map (comp keyword name)) conj field-syms)
         type-from-map `(defn ~map-ctor-name [m]
                          (apply ~ctor-name (map #(get m %) ~fields)))
         default-bodies ['IAssociative
-                        `(-assoc [self k v]
-                                 (let [m (reduce #(assoc %1 %2 (. self %2)) {} ~fields)]
-                                   (~map-ctor-name (assoc m k v))))
+                        (-make-record-assoc-body ctor-name fields)
+
                         `(-contains-key [self k]
                                         (contains? ~(set fields) k))
                         `(-dissoc [self k]
                                   (throw [:pixie.stdlib/NotImplementedException
                                           "dissoc is not supported on defrecords"]))
                         'ILookup
-                        `(-val-at [self k not-found]
-                                  (if (contains? ~(set fields) k)
-                                    (. self k)
-                                    not-found))
+                        (let [self-nm (gensym "self")
+                              k-nm (gensym "k")]
+                          `(-val-at [~self-nm ~k-nm not-found#]
+                                    (case ~k-nm
+                                      ~@(mapcat
+                                         (fn [k]
+                                           [k `(get-field ~self-nm ~k-nm)])
+                                         fields)
+                                      not-found#)))
                         'IObject
-                        `(-str [self]
-                               (str "<" ~(name nm) " " (reduce #(assoc %1 %2 (. self %2)) {} ~fields) ">"))
+                        `(-str [self#]
+                               (str "<" ~(name nm) " " (reduce #(assoc %1 %2 (%2 self#)) {} ~fields) ">"))
                         `(-eq [self other]
                               (and (instance? ~nm other)
                                    ~@(map (fn [field]
-                                            `(= (. self ~field) (. other ~field)))
+                                            `(= (~field self) (~field other)))
                                           fields)))
                         `(-hash [self]
-                                (throw [:pixie.stdlib/NotImplementedException "not implemented"]))]
+                                (hash [~@field-syms]))]
         deftype-decl `(deftype ~nm ~fields ~@default-bodies ~@body)]
     `(do ~type-from-map
          ~deftype-decl)))
@@ -2070,7 +2089,48 @@ The params can be destructuring bindings, see `(doc let)` for details."}
       `(fn* ~@name ~(first (first decls)) ~@(next (first decls)))
       `(fn* ~@name ~@decls))))
 
+;; TODO: implement :>> like in Clojure?
+(defmacro condp
+  "Takes a binary predicate, an expression and a number of two-form clauses.
+Calls the predicate on the first value of each clause and the expression.
+If the result is truthy returns the second value of the clause.
+
+If the number of arguments is odd and no clause matches, the last argument is returned.
+If the number of arguments is even and no clause matches, throws an exception."
+  [pred-form expr & clauses]
+  (let [x (gensym 'expr), pred (gensym 'pred)]
+    `(let [~x ~expr, ~pred ~pred-form]
+       (cond ~@(mapcat
+                 (fn [[a b :as clause]]
+                   (if (> (count clause) 1)
+                     `((~pred ~a ~x) ~b)
+                     `(:else ~a)))
+                 (partition 2 clauses))
+             :else (throw [:pixie.stdlib/MissingClauseException
+                           "No matching clause!"])))))
+
+(defmacro case
+  "Takes an expression and a number of two-form clauses.
+Checks for each clause if the first part is equal to the expression.
+If yes, returns the value of the second part.
+
+The first part of each clause can also be a set. If that is the case, the clause matches when the result of the expression is in the set.
+
+If the number of arguments is odd and no clause matches, the last argument is returned.
+If the number of arguments is even and no clause matches, throws an exception."
+  [expr & args]
+  `(condp #(if (set? %1) (%1 %2) (= %1 %2))
+     ~expr ~@args))
+
+
+
+
 (deftype MultiMethod [dispatch-fn default-val methods]
+  IMessageObject
+  (-get-attr [this kw]
+    (case kw
+      :methods methods
+      :else nil))
   IFn
   (-invoke [self & args]
     (let [dispatch-val (apply dispatch-fn args)
@@ -2079,6 +2139,7 @@ The params can be destructuring bindings, see `(doc let)` for details."}
                    (get @methods default-val))
           _ (assert method (str "no method defined for " dispatch-val))]
       (apply method args))))
+
 
 (defmacro defmulti
   {:doc "Define a multimethod, which dispatches to its methods based on dispatch-fn."
@@ -2105,12 +2166,16 @@ The params can be destructuring bindings, see `(doc let)` for details."}
    :added "0.1"}
   [name dispatch-val params & body]
   `(do
-     (let [methods (.methods ~name)]
+     (let [methods (.-methods ~name)]
        (swap! methods
               assoc
               ~dispatch-val (fn ~params
                               ~@body))
        ~name)))
+
+(defmulti Foo :r)
+(defmethod Foo :r
+  [x] x)
 
 (defmacro declare
   {:doc "Forward declare the given variable names, setting them to nil."
@@ -2212,39 +2277,6 @@ Expands to calls to `extend-type`."
   [coll]
   "Returns a collection that contains all the elements of the argument in reverse order."
   (into () coll))
-
-;; TODO: implement :>> like in Clojure?
-(defmacro condp
-  "Takes a binary predicate, an expression and a number of two-form clauses.
-Calls the predicate on the first value of each clause and the expression.
-If the result is truthy returns the second value of the clause.
-
-If the number of arguments is odd and no clause matches, the last argument is returned.
-If the number of arguments is even and no clause matches, throws an exception."
-  [pred-form expr & clauses]
-  (let [x (gensym 'expr), pred (gensym 'pred)]
-    `(let [~x ~expr, ~pred ~pred-form]
-       (cond ~@(mapcat
-                 (fn [[a b :as clause]]
-                   (if (> (count clause) 1)
-                     `((~pred ~a ~x) ~b)
-                     `(:else ~a)))
-                 (partition 2 clauses))
-             :else (throw [:pixie.stdlib/MissingClauseException
-                           "No matching clause!"])))))
-
-(defmacro case
-  "Takes an expression and a number of two-form clauses.
-Checks for each clause if the first part is equal to the expression.
-If yes, returns the value of the second part.
-
-The first part of each clause can also be a set. If that is the case, the clause matches when the result of the expression is in the set.
-
-If the number of arguments is odd and no clause matches, the last argument is returned.
-If the number of arguments is even and no clause matches, throws an exception."
-  [expr & args]
-  `(condp #(if (set? %1) (%1 %2) (= %1 %2))
-     ~expr ~@args))
 
 (defmacro use
   [ns]
@@ -2455,3 +2487,100 @@ Calling this function on something that is not ISeqable returns a seq with that 
   (fn [v] (str "<Namespace " (name v) ">")))
 
 (extend -repr Namespace -str)
+
+
+(defn bool?
+  [x]
+  (instance? Bool x))
+
+(defprotocol IComparable
+  (-compare [x y]
+    "Compare to objects returing 0 if the same -1 with x is logically smaller than y and 1 if x is logically larger"))
+
+(defn compare-numbers
+  [x y]
+  (cond
+    (> x y) 1
+    (< x y) -1
+    :else 0))
+
+(defn compare-counted
+  [x y]
+  (if (= x y)
+    0
+    (let [min-length (min (count x) (count y))]
+      (loop [n 0]
+        (if (not= min-length n)
+          (let [diff (-compare (nth x n) 
+                               (nth y n))]
+            (if-not (zero? diff)
+              diff
+              (recur (inc n))))
+          ;; We have compared all characters of the smallest string
+          ;; against the largest string.
+          ;; If equal lengths 0 otherwise -1 or 1
+          (compare-numbers (count x) (count y)))))))
+
+(defn compare-named
+  [x y]
+  (if (= x y)
+    0
+    (compare-counted (str x) (str y))))
+
+(extend-protocol IComparable
+  Number
+  (-compare [x y]
+    (if (number? y)
+      (compare-numbers x y)
+      (throw [::ComparisonError (str "Cannot compare: " x " to " y)])))
+
+  Character
+  (-compare [x y]
+    (if (char? y)
+      (compare-numbers (int x) (int y))
+      (throw [::ComparisonError (str "Cannot compare: " x " to " y)])))
+  
+  PersistentVector
+  (-compare [x y]
+    (if (vector? y)
+      (compare-counted x y)
+      (throw [::ComparisonError (str "Cannot compare: " x " to " y)])))
+
+  String
+  (-compare [x y]
+    (if (string? y)
+      (compare-counted (str x) (str y))
+      (throw [::ComparisonError (str "Cannot compare: " x " to " y)])))
+
+  Keyword
+  (-compare [x y]
+    (if (keyword? y)
+      (compare-counted (str x) (str y))
+      (throw [::ComparisonError (str "Cannot compare: " x " to " y)])))
+
+  Symbol
+  (-compare [x y]
+    (if (symbol?  y)
+      (compare-counted (str x) (str y))
+      (throw [::ComparisonError (str "Cannot compare: " x " to " y)])))
+
+  Bool
+  (-compare [x y]
+    (if (bool? y)
+      (cond
+        (= x y) 0
+        (and (true? x) (false? y)) 1
+        :else  -1))
+      (throw [::ComparisonError (str "Cannot compare: " x " to " y)]))
+  
+  Nil
+  (-compare [x y]
+    (if (nil? y)
+      0
+      (throw [::ComparisonError (str "Cannot compare: " x " to " y)]))))
+
+(defn compare
+  [x y]
+  (if (satisfies? IComparable x)
+    (-compare x y)
+    (throw [::ComparisonError (str x " does not satisfy IComparable")])))

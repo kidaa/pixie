@@ -109,6 +109,14 @@
   (t/assert= (nth (range 4) 1 :default) 1)
   (t/assert= (nth "hithere" 1 :deafult) \i))
 
+(t/deftest test-get-on-vector
+  (t/assert= (get [1 2 3] 0) 1)
+  (t/assert= (get [1 2 3] 1) 2)
+  (t/assert= (get [1 2 3] 2) 3)
+  (t/assert= (get [1 2 3] 4) nil)
+  (t/assert= (get [1 2 3] 5) nil)
+  (t/assert= (get [1 2 3] 5 :not-found) :not-found))
+
 (t/deftest test-first
   (t/assert= (first []) nil)
   (t/assert= (first '()) nil)
@@ -536,6 +544,13 @@
     "c must be a type"
     (instance? [Keyword :also-not-a-type] 123)))
 
+(t/deftest test-types-are-types
+  (t/assert= Type (type Keyword))
+  (t/assert= Type (type Integer))
+  (t/assert= Type (type Number))
+  (t/assert= Type (type Object))
+  (t/assert= Type (type Type)))
+
 (t/deftest test-satisfies?
   (t/assert= (satisfies? IIndexed [1 2]) true)
   (t/assert= (satisfies? IIndexed '(1 2)) false)
@@ -547,7 +562,15 @@
     (satisfies? :not-a-proto 123))
   (t/assert-throws? RuntimeException
     "proto must be a Protocol"
-    (satisfies? [IIndexed :also-not-a-proto] [1 2])))
+    (satisfies? [IIndexed :also-not-a-proto] [1 2]))
+  (defprotocol IFoo (foo [this]))
+  (extend-protocol IFoo
+    Number
+    (foo [this] this))
+  (t/assert= (satisfies? IFoo 1) true)
+  (t/assert= (satisfies? IFoo 1.0) true)
+  (t/assert= (satisfies? IFoo 1/2) true)
+  (t/assert= (satisfies? IFoo \a) false))
 
 (t/deftest test-reduce
  (t/assert= 5050 (reduce + (range 101)))

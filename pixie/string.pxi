@@ -1,10 +1,16 @@
 (ns pixie.string
-  (:require [pixie.string.internal :as si]))
+  (:require [pixie.stdlib :as std]
+            [pixie.string.internal :as si]))
 
 ; reexport native string functions
 (def substring si/substring)
 (def index-of (comp #(if (not= -1 %) %) si/index-of))
 (def split si/split)
+
+(defn split-lines
+  "Splits on \\n or \\r\\n, the two typical line breaks."
+  [s]
+  (when s (apply concat (map #(split % "\n") (split s "\r\n")))))
 
 (def ends-with? si/ends-with)
 (def starts-with? si/starts-with)
@@ -45,6 +51,12 @@
     (str (substring s 0 i) r (substring s (+ i (count x))))
     s))
 
+(defn reverse
+   "Returns s with its characters reversed."
+   [s]
+   (when s
+     (apply str (std/reverse s))))
+
 (defn join
   {:doc "Join the elements of the collection using an optional separator"
    :examples [["(require pixie.string :as s)"]
@@ -63,15 +75,22 @@
   "True if s is nil, empty, or contains only whitespace."
   [s]
   (if s
-    (let [white (set whitespace)
-          length (count s)]
-      (loop [index 0]
-        (if (= length index)
-          true
-          (if (white (nth s index))
-            (recur (inc index))
-            false))))
+    (let [white (set whitespace)]
+      (every? white s))
     true))
+
+(defn escape
+  "Return a new string, using cmap to escape each character ch
+   from s as follows:
+
+   If (cmap ch) is nil, append ch to the new string.
+   If (cmap ch) is non-nil, append (str (cmap ch)) instead."
+  [s cmap]
+  (if (or (nil? s)
+          (nil? cmap))
+    s
+    (apply str (map #(if-let [c (cmap %)] c %)
+                    (vec s)))))
 
 (defmacro interp
   ; TODO: This might merit special read syntax

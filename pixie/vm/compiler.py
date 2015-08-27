@@ -1,4 +1,4 @@
-from pixie.vm.object import affirm 
+from pixie.vm.object import affirm
 from pixie.vm.primitives import nil, true, Bool
 from pixie.vm.persistent_vector import EMPTY, PersistentVector
 from pixie.vm.persistent_hash_set import PersistentHashSet
@@ -10,6 +10,8 @@ from pixie.vm.string import Character, String
 from pixie.vm.atom import Atom
 from rpython.rlib.rarithmetic import r_uint, intmask
 from pixie.vm.persistent_list import EmptyList
+from pixie.vm.cons import cons
+from pixie.vm.persistent_list import create_from_list
 
 import pixie.vm.rt as rt
 
@@ -258,7 +260,7 @@ class LocalMacro(LocalType):
 
 
 
-def resolve_var(ctx, name):
+def resolve_var(name):
     return NS_VAR.deref().resolve(name)
 
 def resolve_local(ctx, name):
@@ -270,7 +272,7 @@ def is_macro_call(form, ctx):
         name = rt.name(rt.first(form))
         if resolve_local(ctx, name):
             return None
-        var = resolve_var(ctx, rt.first(form))
+        var = resolve_var(rt.first(form))
 
         if var and var.is_defined():
             val = var.deref()
@@ -321,23 +323,6 @@ def compile_set_literal(form, ctx):
 
     compile_cons(set_call, ctx)
 
-def macroexpand(form):
-    sym = rt.first(form)
-    if isinstance(sym, symbol.Symbol):
-        s = rt.name(sym)
-        if s.startswith(".") and s != u".":
-            if rt.count(form) < 2:
-                raise Exception("malformed dot expression, expecting (.member obj ...)")
-
-            method = rt.keyword(rt.wrap(rt.name(sym)[1:]))
-            obj = rt.first(rt.next(form))
-            dot = rt.symbol(rt.wrap(u"."))
-            call = rt.cons(dot, rt.cons(obj, rt.cons(method, rt.next(rt.next(form)))))
-
-            return call
-
-    return form
-
 def compile_meta(meta, ctx):
     ctx.push_const(code.intern_var(u"pixie.stdlib", u'with-meta'))
     ctx.bytecode.append(code.DUP_NTH)
@@ -351,13 +336,37 @@ def compile_meta(meta, ctx):
     ctx.bytecode.append(1)
     ctx.sub_sp(1)
 
+def maybe_oop_invoke(form):
+    head = rt.first(form)
+    if isinstance(rt.first(form), symbol.Symbol) and rt.name(head).startswith(".-"):
+        postfix = rt.next(form)
+        affirm(rt.count(postfix) == 1, u" Attribute lookups must only have one argument")
+        subject = rt.first(postfix)
+        kw = keyword(rt.name(head)[2:])
+        fn = symbol.symbol(u"pixie.stdlib/-get-attr")
+        return create_from_list([fn, subject, kw])
+
+    elif isinstance(rt.first(form), symbol.Symbol) and rt.name(head).startswith("."):
+        subject = rt.first(rt.next(form))
+        postfix = rt.next(rt.next(form))
+        form = cons(keyword(rt.name(head)[1:]), postfix)
+        form = cons(subject, form)
+        form = cons(symbol.symbol(u"pixie.stdlib/-call-method"), form)
+        return form
+
+    else:
+        return form
+
+
 def compile_form(form, ctx):
     if form is nil:
         ctx.push_const(nil)
         return
 
     if rt._satisfies_QMARK_(rt.ISeq.deref(), form) and form is not nil:
-        form = macroexpand(form)
+
+        form = maybe_oop_invoke(form)
+
         return compile_cons(form, ctx)
     if isinstance(form, numbers.Integer):
         ctx.push_const(form)
@@ -377,7 +386,7 @@ def compile_form(form, ctx):
         ns = rt.namespace(form)
 
         loc = resolve_local(ctx, name)
-        var = resolve_var(ctx, form)
+        var = resolve_var(form)
 
         if var is None and loc:
             loc.emit(ctx)
@@ -409,7 +418,6 @@ def compile_form(form, ctx):
         return
 
     if isinstance(form, PersistentVector):
-        vector_var = rt.vector()
         size = rt.count(form)
         #assert rt.count(form).int_val() == 0
         ctx.push_const(code.intern_var(u"pixie.stdlib", u"vector"))
@@ -513,7 +521,6 @@ LOOP = symbol.symbol(u"loop*")
 def compile_fn_body(name, args, body, ctx):
     new_ctx = Context(rt.name(name), rt.count(args), ctx)
     required_args = add_args(rt.name(name), args, new_ctx)
-    bc = 0
 
     affirm(isinstance(name, symbol.Symbol), u"Function names must be symbols")
 

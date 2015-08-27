@@ -1,6 +1,26 @@
 from rpython.rlib.objectmodel import compute_identity_hash
 import rpython.rlib.jit as jit
 
+
+class FinalizerRegistry(object):
+    def __init__(self):
+        # TODO: PyPy uses a linked list, investigate if we need that too
+        self._registry = []
+
+    def register(self, o):
+        print "register finalizer ", o
+        self._registry.append(o)
+
+    def run_finalizers(self):
+        import pixie.vm.rt as rt
+
+        vals = self._registry
+        self._registry = []
+        for x in vals:
+            rt._finalize_BANG_(x)
+
+finalizer_registry = FinalizerRegistry()
+
 class Object(object):
     """ Base Object for all VM objects
     """
@@ -29,6 +49,10 @@ class Object(object):
     def promote(self):
         return self
 
+
+
+
+
 class TypeRegistry(object):
     def __init__(self):
         self._types = {}
@@ -41,7 +65,6 @@ class TypeRegistry(object):
             self.var_for_type_and_name(nm, tp)
 
     def var_for_type_and_name(self, nm, tp):
-        from pixie.vm.symbol import symbol
         splits = nm.split(u".")
         size = len(splits) - 1
         assert size >= 0
@@ -67,6 +90,7 @@ def get_type_by_name(nm):
     return _type_registry.get_by_name(nm)
 
 class Type(Object):
+    _immutable_fields_ = ["_name", "_has_finalizer?"]
     def __init__(self, name, parent=None, object_inited=True):
         assert isinstance(name, unicode), u"Type names must be unicode"
         _type_registry.register_type(name, self)
@@ -80,6 +104,7 @@ class Type(Object):
 
         self._parent = parent
         self._subclasses = []
+        self._has_finalizer = False
 
     def name(self):
         return self._name
@@ -87,11 +112,22 @@ class Type(Object):
     def type(self):
         return Type._type
 
+    def parent(self):
+        return self._parent
+
     def add_subclass(self, tp):
         self._subclasses.append(tp)
 
     def subclasses(self):
         return self._subclasses
+
+    @jit.elidable_promote()
+    def has_finalizer(self):
+        return self._has_finalizer
+
+    def set_finalizer(self):
+        self._has_finalizer = True
+
 
 Object._type = Type(u"pixie.stdlib.Object", None, False)
 Type._type = Type(u"pixie.stdlib.Type")
@@ -242,7 +278,6 @@ class PolymorphicCodeInfo(ErrorInfo):
 
     def trace_map(self):
         from pixie.vm.string import String
-        from pixie.vm.numbers import Integer
         from pixie.vm.keyword import keyword
 
         tp = self._tp
@@ -261,7 +296,6 @@ class PixieCodeInfo(ErrorInfo):
 
     def trace_map(self):
         from pixie.vm.string import String
-        from pixie.vm.numbers import Integer
         from pixie.vm.keyword import keyword
 
         tm = {keyword(u"type") : keyword(u"pixie")}

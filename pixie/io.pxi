@@ -16,10 +16,10 @@
 (deftype FileStream [fp offset uvbuf]
   IInputStream
   (read [this buffer len]
-    (assert (<= (buffer-capacity buffer) len)
+    (assert (>= (buffer-capacity buffer) len)
             "Not enough capacity in the buffer")
     (let [_ (pixie.ffi/set! uvbuf :base buffer)
-          _ (pixie.ffi/set! uvbuf :len (buffer-capacity buffer))
+          _ (pixie.ffi/set! uvbuf :len len)
           read-count (fs_read fp uvbuf 1 offset)]
       (assert (not (neg? read-count)) "Read Error")
       (set-field! this :offset (+ offset read-count))
@@ -47,10 +47,21 @@
   (assert (string? filename) "Filename must be a string")
   (->FileStream (fs_open filename uv/O_RDONLY 0) 0 (uv/uv_buf_t)))
 
+(defn buffered-read-line
+  [input-stream]
+  (let [line-feed (into #{} (map int [\newline \return]))]
+    (loop [acc []]
+      (let [ch (read-byte input-stream)]
+        (cond
+          (nil? ch) nil
+          (zero? ch) nil
 
-(defn read-line
-  "Read one line from input-stream for each invocation.
-   nil when all lines have been read"
+          (and (pos? ch) (not (line-feed ch)))
+          (recur (conj acc ch))
+
+          :else (transduce (map char) string-builder acc))))))
+
+(defn unbuffered-read-line
   [input-stream]
   (let [line-feed (into #{} (map int [\newline \return]))
         buf (buffer 1)]
@@ -62,7 +73,22 @@
 
           (and (zero? len) (empty? acc)) nil
 
-          :else (apply str (map char acc)))))))
+          :else (transduce (map char) string-builder acc))))))
+
+(defn read-line
+  "Read one line from input-stream for each invocation.
+   nil when all lines have been read. 
+   Pass a BufferedInputStream for best performance."
+  [input-stream]
+  (cond
+    (instance? BufferedInputStream input-stream)
+    (buffered-read-line input-stream)
+
+    (satisfies? IInputStream input-stream) 
+    (unbuffered-read-line input-stream)
+    
+    :else
+    (throw [::Exception "Expected an IInputStream or BufferedInputStream"])))
 
 (defn line-seq
   "Returns the lines of text from input-stream as a lazy sequence of strings.
@@ -79,7 +105,7 @@
             _ (pixie.ffi/set! uvbuf :len (- (count buffer) buffer-offset))
             write-count (fs_write fp uvbuf 1 offset)]
         (when (neg? write-count)
-          (throw [::FileOutputStreamException (uv/uv_err_name read-count)]))
+          (throw [::FileOutputStreamException (uv/uv_err_name write-count)]))
         (set-field! this :offset (+ offset write-count))
         (if (< (+ buffer-offset write-count) (count buffer))
           (recur (+ buffer-offset write-count))
@@ -100,12 +126,14 @@
   IDisposable
   (-dispose! [this]
     (set-buffer-count! buffer idx)
-    (write downstream buffer))
+    (flush this))
   IFlushableStream
   (flush [this]
     (set-buffer-count! buffer idx)
     (set-field! this :idx 0)
-    (write downstream buffer)))
+    (write downstream buffer)
+    (when (satisfies? IFlushableStream downstream)
+      (flush downstream))))
 
 (deftype BufferedInputStream [upstream idx buffer]
   IByteInputStream
@@ -113,10 +141,30 @@
     (when (= idx (count buffer))
       (set-field! this :idx 0)
       (read upstream buffer (buffer-capacity buffer)))
-    (when (pos? (count buffer))
+    (when-not (empty? buffer)
       (let [val (nth buffer idx)]
         (set-field! this :idx (inc idx))
         val)))
+  ISeekableStream
+  (position [this]
+    (+ (- (position upstream) 
+          (count buffer))
+       idx))
+  (rewind [this]
+    (seek this 0))
+  (seek [this pos]
+    ;; We can be clever about seeking. If we are seeking to somewhere with in
+    ;; our current buffer, we can avoid seeking in upstream.
+    (let [upper-bounds (position upstream)
+          lower-bounds (- upper-bounds (count buffer))]
+      (if (and (>= pos lower-bounds)
+               (<= pos upper-bounds))
+        ;; We're in the buffer window :-)
+        (set-field! this :idx (- pos lower-bounds))
+        ;; Put the index at the end of the buffer to force a read from upstream
+        (do
+          (set-field! this :idx (count buffer))
+          (seek upstream pos)))))
   IDisposable
   (-dispose! [this]
     (dispose! buffer)))
@@ -131,9 +179,11 @@
   ([upstream]
    (buffered-input-stream upstream common/DEFAULT-BUFFER-SIZE))
   ([upstream size]
-   (let [b (buffer size)]
-     (set-buffer-count! b size)
-     (->BufferedInputStream upstream size b))))
+   (if (satisfies? IInputStream upstream)
+     (let [b (buffer size)]
+       (set-buffer-count! b size)
+       (->BufferedInputStream upstream size b))
+     (throw [::Exception "Expected upstream to satisfy IInputStream"]))))
 
 (defn throw-on-error [result]
   (when (neg? result)
